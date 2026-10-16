@@ -1,0 +1,121 @@
+name: "Artcraft MacOS Unsigned Build"
+
+# Builds an UNSIGNED (ad-hoc signed) macOS app on the free `macos-latest` runner
+# and uploads the .dmg and zipped .app as workflow artifacts. No Apple
+# certificates, notarization, or GitHub release are involved.
+#
+# Run it from the Actions tab ("Run workflow"), or push to `artcraft-macos-unsigned`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Rust target (universal-apple-darwin, aarch64-apple-darwin, x86_64-apple-darwin)"
+        required: false
+        default: "universal-apple-darwin"
+  push:
+    branches:
+      - artcraft-macos-unsigned
+
+concurrency:
+  group: artcraft-macos-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos-unsigned:
+    runs-on: macos-latest
+    timeout-minutes: 240
+    env:
+      TARGET: ${{ github.event.inputs.target || 'universal-apple-darwin' }}
+      SQLX_OFFLINE: "true"
+      VITE_ENVIRONMENT_TYPE: production
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: free disk space
+        run: |
+          df -h /
+          sudo rm -rf ~/Library/Android/sdk /usr/local/share/dotnet /usr/local/lib/node_modules/@aws-cdk || true
+          sudo rm -rf ~/.ghcup /usr/local/.ghcup ~/hostedtoolcache/CodeQL /Users/runner/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          cache-on-failure: true
+
+      - name: prepare tauri config (mac conf, no signing identity, prebuilt frontend)
+        working-directory: crates/desktop/artcraft
+        run: |
+          cp tauri-mac.conf.json tauri.conf.json
+          # Frontend is built in a separate step; ad-hoc sign ("-") instead of the
+          # original company's Developer ID.
+          jq '.build.beforeBuildCommand = ""
+              | .bundle.macOS = ((.bundle.macOS // {}) + {"signingIdentity": "-"})' \
+            tauri.conf.json > tauri.conf.json.tmp
+          mv tauri.conf.json.tmp tauri.conf.json
+          jq '.build, .bundle' tauri.conf.json
+
+      - name: install frontend dependencies
+        working-directory: frontend
+        run: |
+          node --version
+          npm --version
+          npm ci
+
+      - name: build frontend
+        working-directory: frontend
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: |
+          npx nx run artcraft:build
+          ls -la apps/artcraft/dist/ | head -20
+
+      - name: build tauri app (unsigned)
+        working-directory: crates/desktop/artcraft
+        env:
+          # Make sure no signing/notarization credentials leak in.
+          APPLE_CERTIFICATE: ""
+          APPLE_SIGNING_IDENTITY: ""
+          APPLE_ID: ""
+          APPLE_PASSWORD: ""
+          APPLE_TEAM_ID: ""
+          CI: "true"
+        run: |
+          npx --yes @tauri-apps/cli@^2 --version
+          npx --yes @tauri-apps/cli@^2 build --target "$TARGET" --bundles app,dmg --verbose
+          df -h /
+
+      - name: collect artifacts
+        run: |
+          BUNDLE_DIR="target/$TARGET/release/bundle"
+          ls -la "$BUNDLE_DIR" "$BUNDLE_DIR/macos" "$BUNDLE_DIR/dmg" || true
+          mkdir -p dist-out
+          cp "$BUNDLE_DIR"/dmg/*.dmg dist-out/
+          APP_PATH=$(ls -d "$BUNDLE_DIR"/macos/*.app | head -1)
+          codesign -dv --verbose=2 "$APP_PATH" || true
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "dist-out/$(basename "$APP_PATH" .app)_${TARGET}.app.zip"
+          ls -la dist-out
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArtCraft-macos-${{ env.TARGET }}-unsigned
+          path: dist-out/*
+          if-no-files-found: error
+          retention-days: 14
