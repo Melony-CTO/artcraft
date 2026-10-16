@@ -89,12 +89,8 @@ jobs:
       - name: build tauri app (unsigned)
         working-directory: crates/desktop/artcraft
         env:
-          # Make sure no signing/notarization credentials leak in.
-          APPLE_CERTIFICATE: ""
-          APPLE_SIGNING_IDENTITY: ""
-          APPLE_ID: ""
-          APPLE_PASSWORD: ""
-          APPLE_TEAM_ID: ""
+          # Ad-hoc signing ("-"): no Apple certificate or notarization needed.
+          APPLE_SIGNING_IDENTITY: "-"
           CI: "true"
         run: |
           npx --yes @tauri-apps/cli@^2 --version
